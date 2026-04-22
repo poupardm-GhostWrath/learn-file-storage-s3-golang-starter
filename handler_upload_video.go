@@ -5,6 +5,12 @@ import (
 	"io"
 	"net/http"
 	"mime"
+	"bytes"
+	"math"
+	"fmt"
+	"errors"
+	"os/exec"
+	"encoding/json"
 
 	"github.com/google/uuid"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -89,8 +95,23 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Get Aspect Ratio
+	ratio, err := getVideoAspectRatio(dst.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error getting video aspect ratio", err)
+		return
+	}
+
 	// Upload Video to S3
 	key := getAssetPath(mediaType)
+
+	if ratio == "16:9" {
+		key = "landscape/" + key
+	} else if ratio == "9:16" {
+		key = "portrait/" + key
+	} else {
+		key = "other/" + key
+	}
 
 	s3PutObjectInput := s3.PutObjectInput{
 		Bucket:	aws.String(cfg.s3Bucket),
@@ -115,4 +136,53 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type FFProbe struct {
+		Streams []struct {
+			Width              int    `json:"width,omitempty"`
+			Height             int    `json:"height,omitempty"`
+		} `json:"streams"`
+	}
+
+	args := []string{
+		"-v",
+		"error",
+		"-print_format",
+		"json",
+		"-show_streams",
+		filePath,
+	}
+	cmd := exec.Command("ffprobe", args...)
+
+	var buff bytes.Buffer
+	cmd.Stdout = &buff
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffprobe error: %v", err)
+	}
+
+	var ffprobe FFProbe
+	if err := json.Unmarshal(buff.Bytes(), &ffprobe); err != nil {
+		return "", fmt.Errorf("Couldn't parse ffprobe output: %v", err)
+	}
+
+	if len(ffprobe.Streams) == 0 {
+		return "", errors.New("No video streams found")
+	}
+
+	width := ffprobe.Streams[0].Width
+	height := ffprobe.Streams[0].Height
+	ratio := float64(width) / float64(height)
+	landscape := 16.0 / 9.0
+	portrait := 9.0 / 16.0
+	if math.Abs(ratio - landscape) < 0.01 {
+		return "16:9", nil
+	}
+	if math.Abs(ratio - portrait) < 0.01 {
+		return "9:16", nil
+	}
+	
+	return "other", nil
 }
