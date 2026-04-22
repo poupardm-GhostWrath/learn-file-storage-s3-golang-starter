@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os/exec"
 	"encoding/json"
+	"path"
 
 	"github.com/google/uuid"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -102,21 +103,41 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Upload Video to S3
+	// Get File Key
 	key := getAssetPath(mediaType)
 
-	if ratio == "16:9" {
-		key = "landscape/" + key
-	} else if ratio == "9:16" {
-		key = "portrait/" + key
-	} else {
-		key = "other/" + key
+	directory := ""
+
+	switch ratio {
+	case "16:9":
+		directory = "landscape"
+	case "9:16":
+		directory = "portrait"
+	default:
+		directory = "other"
 	}
 
+	key = path.Join(directory, key)
+
+	// Create processed version
+	processedVideo, err := processVideoForFastStart(dst.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error creating processed version", err)
+		return
+	}
+	defer os.Remove(processedVideo)
+	pFile, err := os.Open(processedVideo)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error opening processed video", err)
+		return
+	}
+	defer pFile.Close()
+
+	// Upload Video to S3
 	s3PutObjectInput := s3.PutObjectInput{
 		Bucket:	aws.String(cfg.s3Bucket),
 		Key: aws.String(key),
-		Body: dst,
+		Body: pFile,
 		ContentType: aws.String(mediaType),
 	}
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3PutObjectInput)
@@ -185,4 +206,38 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 	
 	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputPath := fmt.Sprintf("%s.processing", filePath)
+
+	args := []string{
+		"-i",
+		filePath,
+		"-c",
+		"copy",
+		"-movflags",
+		"faststart",
+		"-f",
+		"mp4",
+		outputPath,
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg error: %v", err)
+	}
+
+	fileInfo, err := os.Stat(outputPath)
+	if err != nil {
+		return "", fmt.Errorf("couldn't stat processed file: %v", err)
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("processed file is empty")
+	}
+
+	return outputPath, nil
 }
